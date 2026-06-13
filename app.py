@@ -3,7 +3,7 @@
 안전공급팀 통합관제 대시보드 (Streamlit)
 - 디자인: 통합관제_대시보드.html 의 네온 글래스모피즘 테마 이식 (다크/라이트 토글)
 - 데이터: Google Sheets(전체 시트) 실시간 연동
-- 수정사항: 데이터 유실 방지(원본 표 분리), 캐시 시간 단축, 엑셀 에러값 방어
+- 수정사항: 특정 시트 누락(메뉴에 안 뜨는 현상) 방지 필터 조건 완화 및 파싱 로직 개선
 실행:  streamlit run app.py
 """
 
@@ -197,10 +197,9 @@ def dedupe_cols(cols):
 
 
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """데이터 유실을 막기 위해 안전하게 빈칸 및 오류값을 제거합니다."""
+    """데이터 유실을 막기 위해 1행도, 1열도 데이터가 없을 때만 빈칸/오류값 제거"""
     df = df.copy()
     df.columns = dedupe_cols(df.columns)
-    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
     
     # 엑셀 에러값 방어 및 문자열 정리
     for c in df.columns:
@@ -213,7 +212,8 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
             })
             df[c] = s
     
-    df = df.dropna(axis=0, how="all")
+    # 완전히 텅 빈 행렬만 제거하고 하나라도 있으면 살림
+    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
     return df.reset_index(drop=True)
 
 
@@ -454,7 +454,7 @@ def render_sheet(name, raw):
     # 1. 원본 데이터의 구조만 안전하게 정리 (타입 변환 안함)
     df_clean = clean_df(raw)
     if df_clean.empty:
-        st.info("이 시트에는 표시할 데이터가 없습니다.")
+        st.info("시트에 데이터가 비어있거나, 병합 셀 등 양식 구조가 복잡하여 데이터 추출이 불가능합니다.")
         return
         
     # 2. 차트 분석용으로만 강제 타입 변환 진행 (실패값은 NaN 처리됨)
@@ -496,7 +496,7 @@ def render_sheet(name, raw):
     # 원본 데이터 출력 (fdf_clean 사용 -> 텍스트 변환 누락 방지)
     st.markdown("<div class='sect'><span class='ico'>🗂️</span>원본 데이터</div>", unsafe_allow_html=True)
     with st.container(border=True):
-        st.dataframe(fdf_clean, use_container_width=True, height=360, hide_index=True)
+        st.dataframe(fdf_clean, use_container_width=True, height=450, hide_index=True)
         st.download_button("⬇️ 이 시트 CSV 다운로드",
                            fdf_clean.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{name}.csv", mime="text/csv",
@@ -508,8 +508,8 @@ def render_overview(sheets):
                 unsafe_allow_html=True)
     counts = {n: len(clean_df(d)) for n, d in sheets.items()}
     total = sum(counts.values())
-    items = [("연동 시트 수", f"{len(sheets)}", "개", "k-cyan"),
-             ("총 데이터 건수", f"{total:,}", "건", "k-blue"),
+    items = [("연동 탭(시트) 수", f"{len(sheets)}", "개", "k-cyan"),
+             ("총 파싱된 행 수", f"{total:,}", "건", "k-blue"),
              ("최다 데이터 시트", max(counts, key=counts.get)[:10], "", "k-purple"),
              ("동기화 상태", "LIVE", "", "k-green")]
     kpi_grid(items)
@@ -517,7 +517,7 @@ def render_overview(sheets):
     c1, c2 = st.columns([1.4, 1])
     with c1:
         with st.container(border=True):
-            card_title("시트별 데이터 보유량", "Google Sheets 각 탭의 행 수", COLORS[0])
+            card_title("시트별 데이터 보유량", "Google Sheets 각 탭의 파싱된 행 수", COLORS[0])
             d = pd.Series(counts).sort_values().reset_index()
             d.columns = ["시트", "건수"]
             fig = px.bar(d, x="건수", y="시트", orientation="h", text="건수")
@@ -563,15 +563,22 @@ with st.sidebar:
 
 try:
     with st.spinner("데이터를 실시간으로 동기화하고 있습니다..."):
-        sheets = load_data()
+        all_sheets = load_data()
         
-    sheets = {k: v for k, v in sheets.items() if v is not None and not v.dropna(how="all").empty}
+    # 빈 데이터라도 행/열 구조가 있다면 무조건 사이드바 메뉴에 보이도록 조건 완화
+    valid_sheets = {}
+    for k, v in all_sheets.items():
+        if v is not None:
+            # 깡통 시트(0x0)만 제외하고, 데이터가 있거나 헤더라도 있으면 무조건 포함
+            if not v.empty or len(v.columns) > 0:
+                valid_sheets[k] = v
+
+    sheets = valid_sheets
 
     with st.sidebar:
         menu = st.radio("📂 분석 대상 선택", ["🏠 전체 개요"] + list(sheets.keys()),
                         label_visibility="collapsed")
         st.markdown("---")
-        # 새로고침 버튼 안내 보강
         if st.button("🔄 데이터 즉시 새로고침", use_container_width=True, help="구글 시트에 수정한 내용을 즉시 반영합니다."):
             load_data.clear(); st.rerun()
         st.caption("💡 시트 수정 후 1분 이내 자동 반영됩니다. 즉시 반영을 원하시면 위 버튼을 누르세요.")
