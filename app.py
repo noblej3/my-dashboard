@@ -3,7 +3,7 @@
 안전공급팀 통합관제 대시보드 (Streamlit)
 - 디자인: 통합관제_대시보드.html 의 네온 글래스모피즘 테마 이식 (다크/라이트 토글)
 - 데이터: Google Sheets(전체 시트) 실시간 연동
-- 기능: 시트별로 만들 수 있는 모든 KPI / 차트(추이·분포·수치·교차분석) / 표 자동 생성
+- 수정사항: 데이터 유실 방지(원본 표 분리), 캐시 시간 단축, 엑셀 에러값 방어
 실행:  streamlit run app.py
 """
 
@@ -33,7 +33,7 @@ if "theme" not in st.session_state:
     st.session_state.theme = "dark"
 
 # ──────────────────────────────────────────────────────────────────────────
-# 1. 테마 CSS (HTML 대시보드의 변수/글래스 스타일 이식)
+# 1. 테마 CSS
 # ──────────────────────────────────────────────────────────────────────────
 def inject_css(theme: str):
     if theme == "dark":
@@ -166,9 +166,9 @@ TXT = "#f8fafc" if IS_DARK else "#0f172a"
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 2. 데이터 로딩
+# 2. 데이터 로딩 (ttl 축소)
 # ──────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)  # 1분 주기로 캐시 (수정 시 빠른 갱신)
 def load_data():
     return pd.read_excel(SHEET_URL, sheet_name=None, engine="openpyxl")
 
@@ -177,7 +177,7 @@ def load_data():
 # 3. 데이터 정리 / 컬럼 분류 헬퍼
 # ──────────────────────────────────────────────────────────────────────────
 FREETEXT_HINT = ("내용", "메모", "공사명", "비고", "조치", "원문", "위치", "장소", "주소",
-                 "구분", "분야")  # 자유서술/주소성 → 차트 제외 후보(구분/분야는 예외 처리)
+                 "구분", "분야")  
 DATE_HINT = ("날짜", "일자", "일시", "시간", "접수일", "시작일", "종료일", "완료일", "점검일", "참관일")
 
 
@@ -197,20 +197,28 @@ def dedupe_cols(cols):
 
 
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    """데이터 유실을 막기 위해 안전하게 빈칸 및 오류값을 제거합니다."""
     df = df.copy()
     df.columns = dedupe_cols(df.columns)
     df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
-    # 문자열 정리
+    
+    # 엑셀 에러값 방어 및 문자열 정리
     for c in df.columns:
         if df[c].dtype == object:
-            df[c] = df[c].astype(str).str.strip().replace({"nan": np.nan, "None": "", "": np.nan})
+            s = df[c].astype(str).str.strip()
+            # pandas의 nan, None 처리 및 엑셀 수식 에러 처리
+            s = s.replace({
+                "nan": np.nan, "NaN": np.nan, "None": np.nan, "": np.nan,
+                "#DIV/0!": np.nan, "#N/A": np.nan, "#VALUE!": np.nan, "#REF!": np.nan
+            })
+            df[c] = s
+    
     df = df.dropna(axis=0, how="all")
     return df.reset_index(drop=True)
 
 
 def parse_dates(s: pd.Series) -> pd.Series:
     raw = s.astype(str)
-    # "2026. 6. 5." / "2026/01/01" / "24.09.06" 등에서 날짜부만 추출
     ext = raw.str.extract(r"(\d{2,4}\s*[.\-/]\s*\d{1,2}\s*[.\-/]\s*\d{1,2})", expand=False)
     norm = ext.str.replace(r"\s*[.\-/]\s*", "-", regex=True).str.rstrip("-")
     dt = pd.to_datetime(norm, errors="coerce", format="mixed")
@@ -226,7 +234,7 @@ def to_numeric(s: pd.Series) -> pd.Series:
 
 
 def classify(df: pd.DataFrame):
-    """컬럼을 date / numeric / categorical / text 로 분류하고 변환된 df 반환"""
+    """차트 분석을 위해 컬럼 타입을 캐스팅합니다. 원본 df는 변형하지 않고 복사본(out)을 사용합니다."""
     out = df.copy()
     dates, nums, cats, texts = [], [], [], []
     n = len(out)
@@ -234,31 +242,34 @@ def classify(df: pd.DataFrame):
         s = out[c]
         name = str(c)
         is_date_name = any(h in name for h in DATE_HINT)
-        # 날짜 시도
+        
         if is_date_name or s.dtype == object:
             dt = parse_dates(s)
             if dt.notna().mean() >= (0.5 if is_date_name else 0.7) and dt.notna().sum() >= 3:
                 out[c] = dt
                 dates.append(c)
                 continue
-        # 숫자 시도
+                
         if pd.api.types.is_numeric_dtype(s):
             out[c] = pd.to_numeric(s, errors="coerce")
             nums.append(c)
             continue
+            
         num = to_numeric(s)
         if num.notna().mean() >= 0.6 and num.notna().sum() >= 3:
             out[c] = num
             nums.append(c)
             continue
-        # 범주 vs 자유텍스트
+            
         nun = s.dropna().nunique()
         ratio = nun / max(n, 1)
         is_freetext = any(h in name for h in FREETEXT_HINT) and name not in ("구분", "분야", "공사종류", "작업종류")
+        
         if 1 < nun <= 25 and ratio < 0.6 and not is_freetext:
             cats.append(c)
         else:
             texts.append(c)
+            
     return out, dates, nums, cats, texts
 
 
@@ -295,7 +306,6 @@ def cfg():
 # 5. 시트 단위 분석 렌더
 # ──────────────────────────────────────────────────────────────────────────
 def kpi_grid(items):
-    """items: list of (label, value, unit, color_class)"""
     html = "<div class='kpis'>"
     for lab, val, unit, cls in items:
         html += (f"<div class='kpi {cls}'><div class='lab'>{lab}</div>"
@@ -308,7 +318,6 @@ def build_kpis(df, dates, nums, cats, texts=None):
     texts = texts or []
     items = [("총 데이터 건수", f"{len(df):,}", "건", "k-cyan")]
 
-    # 날짜 기반
     if dates:
         dc = dates[0]
         valid = df[dc].dropna()
@@ -319,21 +328,18 @@ def build_kpis(df, dates, nums, cats, texts=None):
             items.append(("최근 기록일", last.strftime("%y.%m.%d"), "", "k-blue"))
             items.append(("이번 달 건수", f"{this_month:,}", "건", "k-green"))
 
-    # 위험도 / 긴급
     for c in cats:
         vc = df[c].astype(str)
         if "긴급" in "".join(vc.unique()):
             items.append(("긴급 건수", f"{(vc == '긴급').sum():,}", "건", "k-red"))
             break
 
-    # 원인 = 낙뢰
     if any("원인" in str(c) for c in cats):
         c = next(x for x in cats if "원인" in str(x))
         lightning = (df[c].astype(str) == "낙뢰").sum()
         if lightning:
             items.append(("낙뢰 피해", f"{lightning:,}", "건", "k-amber"))
 
-    # 상태 완료율 (cats + texts 에서 '완료' 값을 갖는 소규모 컬럼 탐색)
     for c in cats + texts:
         s = df[c].dropna().astype(str)
         if s.str.fullmatch("완료").any() and df[c].nunique(dropna=True) <= 25:
@@ -341,7 +347,6 @@ def build_kpis(df, dates, nums, cats, texts=None):
             items.append(("완료율", f"{rate:.0f}", "%", "k-purple"))
             break
 
-    # 대표 수치 합계
     if nums:
         c = nums[0]
         tot = df[c].sum()
@@ -352,10 +357,11 @@ def build_kpis(df, dates, nums, cats, texts=None):
 
 
 def trend_charts(df, dates):
+    if not dates: return
     dc = dates[0]
     tmp = df.dropna(subset=[dc]).copy()
-    if len(tmp) < 2:
-        return
+    if len(tmp) < 2: return
+    
     st.markdown("<div class='sect'><span class='ico'>📈</span>추이 분석</div>", unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     with c1:
@@ -378,16 +384,13 @@ def trend_charts(df, dates):
 
 
 def dist_charts(df, cats):
-    if not cats:
-        return
+    if not cats: return
     st.markdown("<div class='sect'><span class='ico'>🍩</span>분포 분석</div>", unsafe_allow_html=True)
-    # 카디널리티 적은 것 우선 정렬
     ordered = sorted(cats, key=lambda c: df[c].nunique())
     cols = st.columns(3)
     for i, c in enumerate(ordered):
         vc = df[c].dropna().astype(str).value_counts().head(12)
-        if vc.empty:
-            continue
+        if vc.empty: continue
         color = COLORS[i % len(COLORS)]
         with cols[i % 3]:
             with st.container(border=True):
@@ -405,12 +408,10 @@ def dist_charts(df, cats):
 
 
 def numeric_charts(df, nums, cats):
-    if not nums:
-        return
+    if not nums: return
     st.markdown("<div class='sect'><span class='ico'>📊</span>수치 분석</div>", unsafe_allow_html=True)
     cols = st.columns(2)
     slot = 0
-    # 범주별 수치 합계 (대표 수치 1개 × 대표 범주 1개)
     if cats:
         c, n = cats[0], nums[0]
         g = df.groupby(df[c].astype(str))[n].sum().sort_values(ascending=False).head(12)
@@ -423,10 +424,8 @@ def numeric_charts(df, nums, cats):
                     fig.update_traces(marker_color=COLORS[1], textposition="outside")
                     st.plotly_chart(style_fig(fig, 260, False), use_container_width=True, config=cfg())
             slot += 1
-    # 수치 분포 히스토그램
     for n in nums[:3]:
-        if df[n].dropna().nunique() < 2:
-            continue
+        if df[n].dropna().nunique() < 2: continue
         with cols[slot % 2]:
             with st.container(border=True):
                 card_title(f"{n} 분포", "값 구간별 빈도(히스토그램)", COLORS[2])
@@ -437,12 +436,9 @@ def numeric_charts(df, nums, cats):
 
 
 def cross_chart(df, cats):
-    if len(cats) < 2:
-        return
-    # 카디널리티가 너무 크지 않은 두 범주
+    if len(cats) < 2: return
     good = [c for c in cats if df[c].nunique() <= 12]
-    if len(good) < 2:
-        return
+    if len(good) < 2: return
     a, b = good[0], good[1]
     st.markdown("<div class='sect'><span class='ico'>🔀</span>교차 분석</div>", unsafe_allow_html=True)
     with st.container(border=True):
@@ -455,17 +451,23 @@ def cross_chart(df, cats):
 
 
 def render_sheet(name, raw):
-    df = clean_df(raw)
-    if df.empty:
+    # 1. 원본 데이터의 구조만 안전하게 정리 (타입 변환 안함)
+    df_clean = clean_df(raw)
+    if df_clean.empty:
         st.info("이 시트에는 표시할 데이터가 없습니다.")
         return
-    df, dates, nums, cats, texts = classify(df)
+        
+    # 2. 차트 분석용으로만 강제 타입 변환 진행 (실패값은 NaN 처리됨)
+    df_typed, dates, nums, cats, texts = classify(df_clean)
 
-    # 날짜 필터 (대표 날짜 컬럼)
-    fdf = df
+    # 필터 적용을 위해 복사
+    fdf_typed = df_typed.copy()
+    fdf_clean = df_clean.copy()
+
+    # 날짜 필터 로직
     if dates:
         dc = dates[0]
-        valid = df[dc].dropna()
+        valid = df_typed[dc].dropna()
         if len(valid) > 1:
             lo, hi = valid.min().date(), valid.max().date()
             with st.sidebar:
@@ -475,26 +477,28 @@ def render_sheet(name, raw):
                                     key=f"date_{name}", label_visibility="collapsed")
             if isinstance(rng, (tuple, list)) and len(rng) == 2:
                 s, e = pd.Timestamp(rng[0]), pd.Timestamp(rng[1]) + pd.Timedelta(days=1)
-                mask = (df[dc] >= s) & (df[dc] < e)
-                fdf = df[mask | df[dc].isna()]
+                mask = (df_typed[dc] >= s) & (df_typed[dc] < e)
+                keep = mask | df_typed[dc].isna()
+                # 필터 적용 시 차트용과 원본표용 모두 적용
+                fdf_typed = fdf_typed[keep]
+                fdf_clean = fdf_clean[keep]
 
     st.markdown(f"<div class='sect' style='font-size:20px'><span class='ico'>🛰️</span>{name}</div>",
                 unsafe_allow_html=True)
-    build_kpis(fdf, dates, nums, cats, texts)
-    trend_charts(fdf, dates)
-    dist_charts(fdf, cats)
-    numeric_charts(fdf, nums, cats)
-    cross_chart(fdf, cats)
+                
+    # 차트 그리기 (fdf_typed 사용)
+    build_kpis(fdf_typed, dates, nums, cats, texts)
+    trend_charts(fdf_typed, dates)
+    dist_charts(fdf_typed, cats)
+    numeric_charts(fdf_typed, nums, cats)
+    cross_chart(fdf_typed, cats)
 
-    # 원본 데이터
+    # 원본 데이터 출력 (fdf_clean 사용 -> 텍스트 변환 누락 방지)
     st.markdown("<div class='sect'><span class='ico'>🗂️</span>원본 데이터</div>", unsafe_allow_html=True)
     with st.container(border=True):
-        show = fdf.copy()
-        for dc in dates:
-            show[dc] = show[dc].dt.strftime("%Y-%m-%d")
-        st.dataframe(show, use_container_width=True, height=360, hide_index=True)
+        st.dataframe(fdf_clean, use_container_width=True, height=360, hide_index=True)
         st.download_button("⬇️ 이 시트 CSV 다운로드",
-                           fdf.to_csv(index=False).encode("utf-8-sig"),
+                           fdf_clean.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{name}.csv", mime="text/csv",
                            use_container_width=True)
 
@@ -560,16 +564,17 @@ with st.sidebar:
 try:
     with st.spinner("데이터를 실시간으로 동기화하고 있습니다..."):
         sheets = load_data()
-    # 비어있지 않은 시트만
+        
     sheets = {k: v for k, v in sheets.items() if v is not None and not v.dropna(how="all").empty}
 
     with st.sidebar:
         menu = st.radio("📂 분석 대상 선택", ["🏠 전체 개요"] + list(sheets.keys()),
                         label_visibility="collapsed")
         st.markdown("---")
-        if st.button("🔄 데이터 새로고침", use_container_width=True):
+        # 새로고침 버튼 안내 보강
+        if st.button("🔄 데이터 즉시 새로고침", use_container_width=True, help="구글 시트에 수정한 내용을 즉시 반영합니다."):
             load_data.clear(); st.rerun()
-        st.caption("Google Sheets 연동 · 10분 캐시")
+        st.caption("💡 시트 수정 후 1분 이내 자동 반영됩니다. 즉시 반영을 원하시면 위 버튼을 누르세요.")
 
     if menu == "🏠 전체 개요":
         render_overview(sheets)
